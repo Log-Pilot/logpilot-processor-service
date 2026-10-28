@@ -1,119 +1,33 @@
-# logpilot-processor-service — Stream Processing Engine
+# LogPilot Processor Service
 
-> **Consumes raw logs from Redis Streams, normalizes and enriches them, then writes to Apache Druid (analytics) and PostgreSQL (metadata).**
+The first processor iteration consumes events from the shared Redis stream, validates the ingest contract, and stores events in PostgreSQL. It is the persistence stage used by the upcoming query API.
 
----
+## Current behavior
 
-## 📋 Service Overview
+- Reads `logpilot:logs` through the `logpilot-processors` consumer group.
+- Expects each stream entry to contain an `event` field with snake_case JSON emitted by `logpilot-ingest-service`.
+- Validates required event fields and stores valid events in `log_events`.
+- Uses `event_id` as the primary key and `ON CONFLICT DO NOTHING` for safe duplicate delivery.
+- Acknowledges a valid event only after its database write succeeds.
+- Sends malformed events to `logpilot:logs:dlq`, then acknowledges the original entry.
+- Runs Flyway migration `V1__create_log_events.sql` at startup.
 
-| Property | Value |
-|----------|-------|
-| **Service Name** | `logpilot-processor-service` |
-| **Technology** | Spring Boot 3.x, Java 21, Redis Streams Consumer, Apache Druid, PostgreSQL |
-| **Type** | Backend Microservice (Stream Consumer) |
-| **Port** | `8082` |
-| **Communication** | Redis Streams (inbound) → Druid + PostgreSQL (outbound) |
-| **Team Owner** | Backend Engineer #2 |
-| **Build Priority** | Month 1, Week 3–4 |
+## Local configuration
 
----
+Start PostgreSQL and Redis using the Compose setup in `logpilot-infra`, then run this service:
 
-## 🎯 Responsibilities
-
-1. **Redis Stream Consumer** — Continuously reads from `logpilot:logs:{org_id}` streams using consumer groups
-2. **Log Normalization** — Standardize timestamps, severity levels, and field names across different log formats
-3. **Log Enrichment** — Add service metadata (service name, environment, host), assign correlation/trace IDs
-4. **Druid Ingestion** — Write normalized log events to Apache Druid `log_events` datasource via Druid's HTTP ingestion API
-5. **PostgreSQL Writes** — Write incident-related metadata, service health snapshots to PostgreSQL
-6. **Dead Letter Queue** — Route unparseable/invalid logs to a DLQ Redis stream for manual inspection
-7. **Backpressure Handling** — If Druid is slow, buffer in Redis and retry without losing data
-
----
-
-## 📦 Codebase Structure
-
-```
-logpilot-processor-service/
-├── src/
-│   └── main/
-│       ├── java/com/logpilot/processor/
-│       │   ├── ProcessorApplication.java            # Spring Boot entry point
-│       │   ├── config/
-│       │   │   ├── RedisConsumerConfig.java          # Redis Streams consumer group setup
-│       │   │   ├── DruidConfig.java                  # Druid connection settings
-│       │   │   └── ProcessorConfig.java              # Processing tuning params
-│       │   ├── consumer/
-│       │   │   ├── LogStreamConsumer.java             # Main Redis consumer loop
-│       │   │   └── ConsumerGroupManager.java          # Consumer group lifecycle
-│       │   ├── pipeline/
-│       │   │   ├── LogNormalizer.java                 # Normalize timestamp, level formats
-│       │   │   ├── LogEnricher.java                   # Add service metadata, trace IDs
-│       │   │   ├── LogRouter.java                     # Route to Druid / Postgres / DLQ
-│       │   │   └── ProcessingPipeline.java            # Orchestrate normalization → enrichment → routing
-│       │   ├── writer/
-│       │   │   ├── DruidWriter.java                   # HTTP POST to Druid ingestion endpoint
-│       │   │   ├── PostgresWriter.java                # JPA writes for metadata
-│       │   │   └── DeadLetterWriter.java              # Write failed events to DLQ stream
-│       │   ├── model/
-│       │   │   ├── RawLogEvent.java                   # Event from Redis Stream
-│       │   │   ├── NormalizedLogEvent.java             # After normalization
-│       │   │   └── DruidIngestionPayload.java          # Druid-format payload
-│       │   └── metrics/
-│       │       └── ProcessorMetrics.java               # Processing rate, lag, errors
-│       └── resources/
-│           ├── application.yml
-│           └── logback-spring.xml
-├── src/test/java/
-├── Dockerfile
-├── pom.xml
-└── README.md
+```sh
+sh ./mvnw spring-boot:run
 ```
 
----
+Defaults match the local Compose configuration: PostgreSQL at `localhost:5432` (`logpilot` database and user) and Redis at `localhost:6379`. Override them with `DATABASE_URL`, `DATABASE_USERNAME`, `DATABASE_PASSWORD`, `REDIS_HOST`, or `REDIS_PORT`.
 
-## 🔗 Dependencies
+Consumer settings can be changed with `LOG_STREAM`, `LOG_DLQ_STREAM`, `LOG_CONSUMER_GROUP`, `LOG_CONSUMER_NAME`, `LOG_BATCH_SIZE`, and `LOG_POLL_DELAY_MS`.
 
-| Dependency | Purpose |
-|------------|---------|
-| Spring Boot Starter Data Redis | Redis Streams consumer |
-| Spring Boot Starter Data JPA | PostgreSQL writes |
-| Spring Boot Starter WebFlux | Non-blocking HTTP client for Druid API |
-| Spring Boot Starter Actuator | Health, metrics |
-| PostgreSQL Driver | Database connectivity |
-| Jackson | JSON parsing/serialization |
-| Micrometer + Prometheus | Processing lag and throughput metrics |
+## Stored schema
 
----
+`log_events` stores the event ID, organization, service, level, event timestamp, message, trace ID, metadata as JSONB, and database ingestion time. Indexes support common organization/time, service/time, and level/time filters.
 
-## 🔄 Processing Pipeline
+## Scope and limitations
 
-```
-Redis Stream → LogStreamConsumer → ProcessingPipeline:
-                                    ├── LogNormalizer (standardize format)
-                                    ├── LogEnricher (add metadata)
-                                    └── LogRouter:
-                                         ├── DruidWriter (time-series analytics)
-                                         ├── PostgresWriter (metadata)
-                                         └── DeadLetterWriter (failures)
-```
-
----
-
-## 🗄️ Data Stores Written To
-
-| Store | What's Written | Schema |
-|-------|---------------|--------|
-| Apache Druid — `log_events` | All normalized log events | org_id, service_id, level, host, env, trace_id, message, timestamp |
-| PostgreSQL — `service_health` | Periodic health snapshots | service_id, error_rate, p99_latency, log_volume, timestamp |
-| Redis — `logpilot:dlq:{org_id}` | Failed/unparseable events | Raw event + error reason |
-
----
-
-## ✅ Testing Checklist
-
-- [ ] Unit tests for LogNormalizer (different timestamp formats, severity mappings)
-- [ ] Unit tests for LogEnricher (metadata injection)
-- [ ] Integration test: Redis stream → full pipeline → verify Druid payload
-- [ ] DLQ test: malformed log → routed to dead letter queue
-- [ ] Backpressure test: Druid unavailable → events buffered, not lost
-- [ ] Consumer group test: multiple consumer instances sharing load
+This iteration uses one configured consumer name and reads new group entries. It does not yet reclaim abandoned pending entries after a process crash, expose processing metrics, enrich logs, or send data to Druid. Infrastructure and end-to-end behavior require a running Redis and PostgreSQL; Docker is needed if using the provided local Compose setup.
